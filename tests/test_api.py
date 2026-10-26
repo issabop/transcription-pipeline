@@ -57,6 +57,10 @@ def test_transcript_before_done_is_409(make_client, wav):
     assert wait_for(client, job["id"])["status"] == "done"
 
 
+def test_lists_supported_languages(make_client):
+    assert make_client().get("/v1/languages").json() == ["en", "ur"]
+
+
 def test_rejects_unsupported_language(make_client, wav):
     response = upload(make_client(), wav, language="xx")
     assert response.status_code == 422

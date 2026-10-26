@@ -82,14 +82,38 @@ def probe(path: Path) -> AudioInfo:
     audio = next((s for s in data.get("streams", []) if s.get("codec_type") == "audio"), None)
     if audio is None:
         raise NotAudio("File has no audio track")
-    duration = float(data.get("format", {}).get("duration") or 0)
+    duration = float(data.get("format", {}).get("duration") or 0) or duration_from_packets(path)
     if duration <= 0:
         raise NotAudio("Could not read the audio duration")
 
     return AudioInfo(
-        duration=duration,
+        duration=round(duration, 3),
         format=data["format"]["format_name"],
         codec=audio["codec_name"],
         sample_rate=int(audio["sample_rate"]),
         channels=int(audio["channels"]),
     )
+
+
+def duration_from_packets(path: Path) -> float:
+    """Length from the last audio packet's timestamp, for files whose header has no duration.
+
+    Browser recordings (MediaRecorder WebM) are written as a stream, so the length is never filled in.
+    This reads packet timestamps only; nothing is decoded.
+    """
+    try:
+        result = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "a:0",
+             "-show_entries", "packet=pts_time,duration_time", "-of", "csv=p=0", str(path)],
+            capture_output=True, text=True, timeout=PROBE_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired:
+        return 0.0
+    ends = []
+    for line in result.stdout.splitlines():
+        pts, _, length = line.strip().strip(",").partition(",")
+        try:
+            ends.append(float(pts) + float(length or 0))
+        except ValueError:
+            continue
+    return max(ends, default=0.0)

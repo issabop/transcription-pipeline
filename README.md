@@ -1,6 +1,6 @@
 # Transcription Pipeline
 
-A small service that turns audio into a timestamped transcript and prepares it for downstream use. Upload a file and get back segments with start and end times, word timestamps, detected language, pauses and speaking stats, plus SRT, WebVTT or plain-text exports.
+A small service that turns audio into a timestamped transcript and prepares it for downstream use. Upload a file (or record one in the browser) and get back segments with start and end times, word timestamps, detected language, pauses and speaking stats, plus SRT, WebVTT or plain-text exports.
 
 **Live demo: https://transcribe.issaumer.com**. Upload a file in the browser, or try the API at [/docs](https://transcribe.issaumer.com/docs). Nothing to install.
 
@@ -20,7 +20,7 @@ Built with **FastAPI**, **ffmpeg** and **faster-whisper** (open-source Whisper),
 
 ## Using it
 
-**In the browser:** open the [live demo](https://transcribe.issaumer.com), pick a file, and watch the progress. The result shows the language, stats, every segment with its timestamps (pauses inline if you want them) and download links.
+**In the browser:** open the [live demo](https://transcribe.issaumer.com), pick a file or record yourself with the microphone, and watch the progress. The result shows the language, stats, every segment with its timestamps (pauses inline if you want them) and download links.
 
 **From the API:**
 
@@ -68,6 +68,7 @@ A finished job (trimmed):
 | `POST /v1/transcriptions` | Upload a file (`file`, optional `language` such as `en` or `ur`). Returns **202** and a job, with a `Location` header |
 | `GET /v1/transcriptions/{id}` | Status (`queued`, `processing`, `done`, `failed`), progress, and the transcript when done |
 | `GET /v1/transcriptions/{id}/transcript` | `format=srt`, `vtt` or `txt`; `pauses=true` adds `[pause 2.1s]` markers to `txt` |
+| `GET /v1/languages` | Language codes the model supports (for the `language` field) |
 | `GET /health` | Liveness, plus the model, device and upload limits in use |
 
 Errors are JSON `{"detail": "..."}` with a meaningful status: **413** too large, **415** not audio, **422** too long or an unsupported language, **404** unknown job, **409** not finished yet, **429** queue full.
@@ -85,7 +86,7 @@ Each stage is one file in `app/pipeline/`, in the order the audio flows:
 
 | File | Stage |
 |---|---|
-| `ingest.py` | Streams the upload to disk in 1 MB chunks under a random name, then asks **ffprobe** what is really inside. Enforces the size and duration limits |
+| `ingest.py` | Streams the upload to disk in 1 MB chunks under a random name, then asks **ffprobe** what is really inside. Enforces the size and duration limits, including for browser recordings, whose WebM header has no duration (it's read from the packet timestamps instead) |
 | `audio.py` | **ffmpeg** converts anything (MP3, M4A, FLAC, OGG, even a video's soundtrack) to 16 kHz mono 16-bit WAV, which is what Whisper expects |
 | `transcribe.py` | The `Transcriber` interface and the faster-whisper engine: voice activity detection, word timestamps, GPU when available |
 | `process.py` | Clean-up, pause detection from word gaps, and stats |
@@ -97,6 +98,7 @@ Around them: `jobs.py` (queue, workers, retries, recovery), `storage.py` (SQLite
 
 - **The engine sits behind an interface.** The pipeline only knows `Transcriber.transcribe()`. Swapping in another model or a hosted API, or a fake for tests, touches one file.
 - **faster-whisper with `large-v3-turbo` as the default.** It covers 99 languages, including Urdu and mixed English/Urdu speech, which faster English-only models (e.g. NVIDIA Parakeet) can't handle. faster-whisper runs Whisper on CTranslate2 with int8 quantisation on CPU. The default was picked by measuring (see [Benchmarks](#benchmarks)).
+- **Browser recordings are just uploads.** The page records with the browser's MediaRecorder (with echo cancellation and noise suppression) and sends the result through the same pipeline, so there's no separate code path to maintain. Real-time streaming transcription (WebSocket, partial results) is the natural next step, but it's a different system and out of scope here.
 - **Never trust the extension.** ffprobe has to find a real audio stream with a duration. A renamed text file is rejected, while a video's soundtrack is accepted.
 - **ffmpeg is the only decoder.** The model receives samples read straight from the converted WAV, so audio is decoded once. This also sidesteps a PyAV/faster-whisper incompatibility found during the build.
 - **Asynchronous jobs.** Transcription can take minutes, so uploads return `202` immediately and the work happens in the background with visible progress. The model is loaded once and shared.
@@ -174,7 +176,7 @@ Every setting is an environment variable with a sensible default (see `.env.exam
 
 ```bash
 pip install -r requirements-dev.txt
-pytest              # 39 fast tests, about 7 s, using a fake engine and audio generated with ffmpeg
+pytest              # 42 fast tests, about 7 s, using a fake engine and audio generated with ffmpeg
 pytest -m slow      # one end-to-end test with a real Whisper model on samples/jfk.flac
 ```
 

@@ -25,6 +25,27 @@ def test_accepts_common_audio_formats(tmp_path, name):
     assert info.duration == pytest.approx(3, abs=0.1)
 
 
+def streamed_webm(tmp_path, seconds: float):
+    """WebM written to a pipe has no duration in its header, exactly like a browser (MediaRecorder) recording."""
+    result = subprocess.run(
+        ["ffmpeg", "-v", "error", "-f", "lavfi", "-i", f"sine=d={seconds}", "-c:a", "libopus", "-f", "webm", "pipe:1"],
+        capture_output=True, check=True,
+    )
+    return result.stdout
+
+
+def test_accepts_a_browser_recording_with_no_duration_in_its_header(tmp_path):
+    _, info = run_ingest(streamed_webm(tmp_path, 3), tmp_path)
+    assert info.codec == "opus"
+    assert info.duration == pytest.approx(3, abs=0.1)
+
+
+def test_duration_limit_still_applies_to_browser_recordings(tmp_path):
+    with pytest.raises(AudioTooLong):
+        run_ingest(streamed_webm(tmp_path, 90), tmp_path, max_seconds=60)
+    assert_nothing_left(tmp_path)
+
+
 def test_accepts_the_audio_track_of_a_video(tmp_path):
     video = make_audio(tmp_path / "clip.mp4", extra=("-f", "lavfi", "-i", "testsrc=d=2:s=64x64", "-shortest"))
     _, info = run_ingest(video.read_bytes(), tmp_path)

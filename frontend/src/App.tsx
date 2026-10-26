@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react"
-import { AlertCircle, Code, Download, FileAudio, Loader2 } from "lucide-react"
+import { AlertCircle, Download, FileAudio, Loader2 } from "lucide-react"
 
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Badge } from "@/components/ui/badge"
@@ -12,21 +12,39 @@ import { ScrollArea } from "@/components/ui/scroll-area"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { Separator } from "@/components/ui/separator"
 import { Switch } from "@/components/ui/switch"
-import { createJob, exportUrl, getHealth, getJob, type Health, type Job, type Segment, type Transcript } from "@/api"
+import { cn } from "@/lib/utils"
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
+import { Recorder } from "@/components/recorder"
+import {
+  createJob,
+  exportUrl,
+  getHealth,
+  getJob,
+  getLanguages,
+  type Health,
+  type Job,
+  type Segment,
+  type Transcript,
+} from "@/api"
 
-const REPO_URL = "https://github.com/issabop/transcription-pipeline"
 const POLL_MS = 1000
 
-const LANGUAGES = [
-  ["auto", "Detect automatically"],
-  ["en", "English"],
-  ["ur", "Urdu"],
-  ["hi", "Hindi"],
-  ["ar", "Arabic"],
-  ["fr", "French"],
-  ["de", "German"],
-  ["es", "Spanish"],
-] as const
+// Whisper uses a few codes the browser doesn't name (e.g. "jw" for Javanese).
+const LANGUAGE_NAME_FIXES: Record<string, string> = {
+  jw: "Javanese",
+  haw: "Hawaiian",
+  yue: "Cantonese",
+}
+const languageNames = new Intl.DisplayNames(["en"], { type: "language" })
+
+function languageName(code: string): string {
+  if (LANGUAGE_NAME_FIXES[code]) return LANGUAGE_NAME_FIXES[code]
+  try {
+    return languageNames.of(code) ?? code
+  } catch {
+    return code
+  }
+}
 
 function clock(seconds: number): string {
   const whole = Math.floor(seconds)
@@ -40,8 +58,11 @@ function clock(seconds: number): string {
 
 export default function App() {
   const [health, setHealth] = useState<Health | null>(null)
+  const [source, setSource] = useState<"upload" | "record">("upload")
   const [file, setFile] = useState<File | null>(null)
+  const [recording, setRecording] = useState<File | null>(null)
   const [language, setLanguage] = useState("auto")
+  const [languages, setLanguages] = useState<[string, string][]>([])
   const [job, setJob] = useState<Job | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [uploading, setUploading] = useState(false)
@@ -49,11 +70,19 @@ export default function App() {
   const timer = useRef<number | undefined>(undefined)
 
   useEffect(() => {
-    getHealth().then(setHealth).catch(() => setHealth(null))
+    getHealth()
+      .then(setHealth)
+      .catch(() => setHealth(null))
+    getLanguages()
+      .then((codes) =>
+        setLanguages(codes.map((c): [string, string] => [c, languageName(c)]).sort((a, b) => a[1].localeCompare(b[1]))),
+      )
+      .catch(() => setLanguages([]))
     return () => window.clearTimeout(timer.current)
   }, [])
 
   const busy = uploading || job?.status === "queued" || job?.status === "processing"
+  const selected = source === "upload" ? file : recording
 
   function poll(id: string) {
     timer.current = window.setTimeout(async () => {
@@ -69,13 +98,13 @@ export default function App() {
 
   async function submit(event: React.FormEvent) {
     event.preventDefault()
-    if (!file) return
+    if (!selected) return
     window.clearTimeout(timer.current)
     setError(null)
     setJob(null)
     setUploading(true)
     try {
-      const created = await createJob(file, language === "auto" ? null : language)
+      const created = await createJob(selected, language === "auto" ? null : language)
       setJob(created)
       poll(created.id)
     } catch (e) {
@@ -86,24 +115,13 @@ export default function App() {
   }
 
   return (
-    <div className="min-h-svh bg-background text-foreground">
-      <main className="mx-auto flex max-w-3xl flex-col gap-6 px-4 py-10 sm:py-14">
-        <header className="flex flex-col gap-2">
-          <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-2">
-            <h1 className="text-2xl font-semibold tracking-tight">Transcription Pipeline</h1>
-            <div className="flex gap-2">
-              <Button variant="ghost" size="sm" asChild>
-                <a href="/docs">API docs</a>
-              </Button>
-              <Button variant="ghost" size="sm" asChild>
-                <a href={REPO_URL} target="_blank" rel="noreferrer">
-                  <Code /> Source
-                </a>
-              </Button>
-            </div>
-          </div>
-          <p className="text-muted-foreground">
-            Upload an audio or video file and get a timestamped transcript, with word timings, pauses and stats.
+    <div className="bg-background text-foreground">
+      <main className="mx-auto flex min-h-svh max-w-3xl flex-col justify-center gap-6 px-4 py-10 sm:py-14">
+        <header className="flex flex-col items-center gap-2 text-center">
+          <h1 className="text-3xl font-semibold tracking-tight">Transcription Pipeline</h1>
+          <p className="max-w-xl text-muted-foreground">
+            Upload an audio or video file, or record yourself, and get a timestamped transcript with word timings,
+            pauses and stats.
           </p>
         </header>
 
@@ -111,44 +129,66 @@ export default function App() {
           <CardHeader>
             <CardTitle>New transcription</CardTitle>
             <CardDescription>
-              MP3, WAV, M4A, FLAC, OGG or a video file
+              Any audio or video file, or a recording from your microphone
               {health && ` · up to ${health.max_upload_mb} MB and ${health.max_duration_minutes} minutes`}
             </CardDescription>
           </CardHeader>
           <CardContent>
             <form onSubmit={submit} className="flex flex-col gap-5">
-              <div className="grid gap-5 sm:grid-cols-[1fr_220px]">
-                <div className="flex flex-col gap-2">
-                  <Label htmlFor="file">File</Label>
+              <Tabs value={source} onValueChange={(v) => setSource(v as "upload" | "record")}>
+                <TabsList>
+                  <TabsTrigger value="upload" disabled={busy}>
+                    Upload a file
+                  </TabsTrigger>
+                  <TabsTrigger value="record" disabled={busy}>
+                    Record
+                  </TabsTrigger>
+                </TabsList>
+                {/* Both tabs stay mounted, so switching never throws away a chosen file or a recording. */}
+                <TabsContent value="upload" forceMount className="pt-2 data-[state=inactive]:hidden">
                   <Input
-                    id="file"
+                    aria-label="Audio or video file"
                     type="file"
                     accept="audio/*,video/*"
                     onChange={(e) => setFile(e.target.files?.[0] ?? null)}
                     disabled={busy}
                   />
-                </div>
-                <div className="flex flex-col gap-2">
-                  <Label htmlFor="language">Language</Label>
-                  <Select value={language} onValueChange={setLanguage} disabled={busy}>
-                    <SelectTrigger id="language" className="w-full">
-                      <SelectValue />
-                    </SelectTrigger>
-                    <SelectContent>
-                      {LANGUAGES.map(([code, name]) => (
-                        <SelectItem key={code} value={code}>
-                          {name}
-                        </SelectItem>
-                      ))}
-                    </SelectContent>
-                  </Select>
-                </div>
+                </TabsContent>
+                <TabsContent value="record" forceMount className="pt-2 data-[state=inactive]:hidden">
+                  <Recorder
+                    maxSeconds={(health?.max_duration_minutes ?? 30) * 60}
+                    disabled={busy}
+                    onRecorded={setRecording}
+                    onError={setError}
+                  />
+                </TabsContent>
+              </Tabs>
+              <div className="flex flex-col gap-2 sm:max-w-[220px]">
+                <Label htmlFor="language">Language</Label>
+                <Select value={language} onValueChange={setLanguage} disabled={busy}>
+                  <SelectTrigger id="language" className="w-full">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="auto">Detect automatically</SelectItem>
+                    {languages.map(([code, name]) => (
+                      <SelectItem key={code} value={code}>
+                        {name}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
               </div>
-              <div>
-                <Button type="submit" disabled={!file || busy}>
+              <div className="flex flex-wrap items-center gap-3">
+                <Button type="submit" disabled={!selected || busy}>
                   {busy ? <Loader2 className="animate-spin" /> : <FileAudio />}
                   {uploading ? "Uploading…" : busy ? "Transcribing…" : "Transcribe"}
                 </Button>
+                {!selected && !busy && (
+                  <span className="text-sm text-muted-foreground">
+                    {source === "upload" ? "Choose a file to transcribe." : "Record something first."}
+                  </span>
+                )}
               </div>
             </form>
           </CardContent>
@@ -180,11 +220,7 @@ export default function App() {
 
 function JobStatusCard({ job }: { job: Job }) {
   const failed = job.status === "failed"
-  const label = failed
-    ? "Failed"
-    : job.status === "queued"
-      ? job.error ?? "Waiting in the queue…"
-      : "Transcribing…"
+  const label = failed ? "Failed" : job.status === "queued" ? (job.error ?? "Waiting in the queue…") : "Transcribing…"
   return (
     <Card>
       <CardContent className="flex flex-col gap-3">
@@ -266,13 +302,19 @@ function ResultCard({
           </div>
         </div>
 
-        <ScrollArea className="h-[420px] rounded-lg border">
-          <ol className="divide-y">
-            {t.segments.map((s) => (
-              <SegmentRow key={s.id} segment={s} showPauses={showPauses} pauseAfter={pauseAfter} />
-            ))}
-          </ol>
-        </ScrollArea>
+        {t.segments.length === 0 ? (
+          <p className="rounded-lg border px-4 py-10 text-center text-sm text-muted-foreground">
+            No speech was detected in this audio.
+          </p>
+        ) : (
+          <ScrollArea className={cn("rounded-lg border", t.segments.length > 8 && "h-[420px]")}>
+            <ol className="divide-y">
+              {t.segments.map((s) => (
+                <SegmentRow key={s.id} segment={s} showPauses={showPauses} pauseAfter={pauseAfter} />
+              ))}
+            </ol>
+          </ScrollArea>
+        )}
       </CardContent>
     </Card>
   )

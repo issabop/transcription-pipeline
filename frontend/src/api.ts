@@ -73,6 +73,8 @@ async function request<T>(url: string, init?: RequestInit): Promise<T> {
 
 export const getHealth = () => request<Health>("/health")
 
+export const getLanguages = () => request<string[]>("/v1/languages")
+
 export function createJob(file: File, language: string | null): Promise<Job> {
   const form = new FormData()
   form.append("file", file)

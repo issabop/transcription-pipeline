@@ -83,6 +83,11 @@ def create_app(config: Settings = settings, transcriber: Transcriber | None = No
             "max_duration_minutes": config.max_duration_minutes,
         }
 
+    @app.get("/v1/languages")
+    def languages(request: Request) -> list[str]:
+        """Language codes the model can transcribe, for the `language` field."""
+        return sorted(request.app.state.transcriber.supported_languages)
+
     @app.post("/v1/transcriptions", status_code=202, response_model=Job)
     def create_transcription(
         request: Request,
