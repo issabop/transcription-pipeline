@@ -85,7 +85,8 @@ export function Recorder({
     onRecorded(null)
     ticker.current = window.setInterval(() => {
       setSeconds((s) => {
-        if (s + 1 >= maxSeconds) rec.state === "recording" && rec.stop() // the server's length limit
+        // Stop at the server's length limit, so the recording is never rejected for being too long
+        if (s + 1 >= maxSeconds && rec.state === "recording") rec.stop()
         return s + 1
       })
     }, 1000)

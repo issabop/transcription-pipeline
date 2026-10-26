@@ -1,40 +1,45 @@
 # Transcription Pipeline
 
-A small service that turns audio into a timestamped transcript and prepares it for downstream use. Upload a file (or record one in the browser) and get back segments with start and end times, word timestamps, detected language, pauses and speaking stats, plus SRT, WebVTT or plain-text exports.
+[![CI](https://github.com/issabop/transcription-pipeline/actions/workflows/ci.yml/badge.svg)](https://github.com/issabop/transcription-pipeline/actions/workflows/ci.yml)
 
-**Live demo: https://transcribe.issaumer.com**. Upload a file in the browser, or try the API at [/docs](https://transcribe.issaumer.com/docs). Nothing to install.
+A service that turns speech into a timestamped transcript and prepares it for downstream use: segments with start and end times, word timestamps, detected language, pauses, speaking stats, and SRT, WebVTT or plain-text exports.
 
-Built with **FastAPI**, **ffmpeg** and **faster-whisper** (open-source Whisper), with a small React + shadcn/ui page on top. It runs on CPU and uses a GPU automatically when there is one.
+**Live demo: https://transcribe.issaumer.com**. Upload a file or record from the microphone, or use the API via [/docs](https://transcribe.issaumer.com/docs). The demo accepts files up to 100 MB and 30 minutes.
+
+Built with **FastAPI**, **ffmpeg** and **faster-whisper**, with a small React + shadcn/ui front end.
 
 ## Contents
 
-- [Using it](#using-it)
+- [API](#api)
 - [How it works](#how-it-works)
 - [Design decisions](#design-decisions)
 - [Answers to the assignment questions](#answers-to-the-assignment-questions)
-- [Benchmarks](#benchmarks)
+- [Model choice and benchmarks](#model-choice-and-benchmarks)
 - [Configuration](#configuration)
 - [Tests](#tests)
-- [Limitations and next steps](#limitations-and-next-steps)
-- [Running it yourself](#running-it-yourself)
+- [Limitations](#limitations)
+- [Running locally](#running-locally)
 
-## Using it
-
-**In the browser:** open the [live demo](https://transcribe.issaumer.com), pick a file or record yourself with the microphone, and watch the progress. The result shows the language, stats, every segment with its timestamps (pauses inline if you want them) and download links.
-
-**From the API:**
+## API
 
 ```bash
-# 1. Upload: returns 202 with a job id straight away
-curl -F "file=@samples/jfk.flac" -F "language=en" https://transcribe.issaumer.com/v1/transcriptions
+# Upload: returns 202 and a job id immediately
+curl -F "file=@samples/jfk.flac" https://transcribe.issaumer.com/v1/transcriptions
 
-# 2. Poll until status is "done"
+# Poll until "status" is "done"
 curl https://transcribe.issaumer.com/v1/transcriptions/<id>
 
-# 3. Download as subtitles or text
+# Export
 curl "https://transcribe.issaumer.com/v1/transcriptions/<id>/transcript?format=srt"
-curl "https://transcribe.issaumer.com/v1/transcriptions/<id>/transcript?format=txt&pauses=true"
 ```
+
+| Endpoint | Description |
+|---|---|
+| `POST /v1/transcriptions` | Multipart upload: `file`, plus optional `language` (e.g. `en`, `ur`; auto-detected if omitted). Returns `202` with the job and a `Location` header |
+| `GET /v1/transcriptions/{id}` | Status (`queued`, `processing`, `done`, `failed`), progress, and the transcript once done |
+| `GET /v1/transcriptions/{id}/transcript` | `format=srt`, `vtt` or `txt`; with `txt`, `pauses=true` adds `[pause 2.1s]` markers |
+| `GET /v1/languages` | Supported language codes |
+| `GET /health` | Liveness, model, device and limits |
 
 A finished job (trimmed):
 
@@ -43,179 +48,136 @@ A finished job (trimmed):
   "id": "e1f76dbadd654e2997586abcbf7d4ce3",
   "status": "done",
   "progress": 1.0,
-  "attempts": 1,
   "audio": { "duration": 11.0, "format": "flac", "codec": "flac", "sample_rate": 44100, "channels": 1 },
   "result": {
     "language": "en",
-    "language_probability": 0.939,
+    "language_probability": 0.94,
     "duration": 11.0,
-    "text": "And so my fellow Americans, ask not what your country can do for you, ask what you can do for your country.",
+    "text": "And so, my fellow Americans, ask not what your country can do for you, ask what you can do for your country.",
     "segments": [
-      {
-        "id": 0, "start": 0.0, "end": 11.0,
-        "text": "And so my fellow Americans, ask not what ...",
-        "words": [{ "start": 0.0, "end": 0.3, "text": "And" }, "..."]
-      }
+      { "id": 0, "start": 0.0, "end": 10.34, "text": "And so, my fellow Americans, ...", "words": [{ "start": 0.0, "end": 0.3, "text": "And" }] }
     ],
     "pauses": [],
-    "stats": { "word_count": 22, "speech_seconds": 11.0, "speech_ratio": 1.0, "words_per_minute": 120.0 }
+    "stats": { "word_count": 22, "speech_seconds": 10.34, "speech_ratio": 0.94, "words_per_minute": 127.7 }
   }
 }
 ```
 
-| Endpoint | What it does |
-|---|---|
-| `POST /v1/transcriptions` | Upload a file (`file`, optional `language` such as `en` or `ur`). Returns **202** and a job, with a `Location` header |
-| `GET /v1/transcriptions/{id}` | Status (`queued`, `processing`, `done`, `failed`), progress, and the transcript when done |
-| `GET /v1/transcriptions/{id}/transcript` | `format=srt`, `vtt` or `txt`; `pauses=true` adds `[pause 2.1s]` markers to `txt` |
-| `GET /v1/languages` | Language codes the model supports (for the `language` field) |
-| `GET /health` | Liveness, plus the model, device and upload limits in use |
-
-Errors are JSON `{"detail": "..."}` with a meaningful status: **413** too large, **415** not audio, **422** too long or an unsupported language, **404** unknown job, **409** not finished yet, **429** queue full.
+Errors return `{"detail": "..."}` with `413` (too large), `415` (not audio), `422` (too long or unsupported language), `404` (unknown job), `409` (not finished) or `429` (queue full).
 
 ## How it works
 
 ```
-upload ──► ingest ──► job queue ──► worker: audio ──► transcribe ──► process ──► SQLite
-           (validate)  (202 + id)          (ffmpeg)    (Whisper)     (clean,       │
-                                                                     pauses,       ▼
-                                                                     stats)    GET result / export
+upload ──► ingest ──► queue ──► worker: audio ──► transcribe ──► process ──► SQLite ──► result / export
+          (validate)  (202)            (ffmpeg)    (Whisper)     (clean, pauses, stats)
 ```
 
-Each stage is one file in `app/pipeline/`, in the order the audio flows:
-
-| File | Stage |
+| Module | Responsibility |
 |---|---|
-| `ingest.py` | Streams the upload to disk in 1 MB chunks under a random name, then asks **ffprobe** what is really inside. Enforces the size and duration limits, including for browser recordings, whose WebM header has no duration (it's read from the packet timestamps instead) |
-| `audio.py` | **ffmpeg** converts anything (MP3, M4A, FLAC, OGG, even a video's soundtrack) to 16 kHz mono 16-bit WAV, which is what Whisper expects |
-| `transcribe.py` | The `Transcriber` interface and the faster-whisper engine: voice activity detection, word timestamps, GPU when available |
-| `process.py` | Clean-up, pause detection from word gaps, and stats |
-| `export.py` | SRT, WebVTT and plain text |
-
-Around them: `jobs.py` (queue, workers, retries, recovery), `storage.py` (SQLite and audio files) and `main.py` (the API). The page lives in `frontend/` (React, Vite, Tailwind and shadcn/ui components). It's built into static files that FastAPI serves, so it's one container and one URL, with no Node at runtime.
+| `app/pipeline/ingest.py` | Streams the upload to disk in 1 MB chunks under a random name, validates it with ffprobe, and enforces the size and duration limits |
+| `app/pipeline/audio.py` | Converts any input to 16 kHz mono 16-bit WAV with ffmpeg |
+| `app/pipeline/transcribe.py` | The `Transcriber` interface and the faster-whisper implementation (VAD, word timestamps, GPU when available) |
+| `app/pipeline/process.py` | Clean-up, pause detection and stats |
+| `app/pipeline/export.py` | SRT, WebVTT and plain text |
+| `app/jobs.py` | Queue, worker pool, retries and recovery |
+| `app/storage.py` | Job records in SQLite; audio files while a job runs |
+| `app/main.py` | The HTTP API, which also serves the built front end |
+| `frontend/` | React + Vite + shadcn/ui page, built to static files (no Node at runtime) |
 
 ## Design decisions
 
-- **The engine sits behind an interface.** The pipeline only knows `Transcriber.transcribe()`. Swapping in another model or a hosted API, or a fake for tests, touches one file.
-- **faster-whisper with `large-v3-turbo` as the default.** It covers 99 languages, including Urdu and mixed English/Urdu speech, which faster English-only models (e.g. NVIDIA Parakeet) can't handle. faster-whisper runs Whisper on CTranslate2 with int8 quantisation on CPU. The default was picked by measuring (see [Benchmarks](#benchmarks)).
-- **Browser recordings are just uploads.** The page records with the browser's MediaRecorder (with echo cancellation and noise suppression) and sends the result through the same pipeline, so there's no separate code path to maintain. Real-time streaming transcription (WebSocket, partial results) is the natural next step, but it's a different system and out of scope here.
-- **Never trust the extension.** ffprobe has to find a real audio stream with a duration. A renamed text file is rejected, while a video's soundtrack is accepted.
-- **ffmpeg is the only decoder.** The model receives samples read straight from the converted WAV, so audio is decoded once. This also sidesteps a PyAV/faster-whisper incompatibility found during the build.
-- **Asynchronous jobs.** Transcription can take minutes, so uploads return `202` immediately and the work happens in the background with visible progress. The model is loaded once and shared.
-- **Temporary and permanent failures are treated differently.** Undecodable audio fails immediately. Anything else is retried with exponential backoff (2 s, 4 s), up to 3 attempts.
-- **Jobs survive restarts.** State lives in SQLite. On startup, interrupted jobs are queued again, unless they were already on their last attempt (so a file that crashes the server can't loop forever). The worker skips any job that isn't `queued`, so a duplicate queue entry is harmless.
-- **Privacy by default.** Audio is deleted as soon as a job finishes; only the transcript is kept.
-- **Pauses come from word timestamps.** Gaps between segments alone missed pauses inside a segment. Word timestamps cost about 5–10% more time and make pause positions exact.
-- **Configuration lives in the environment** (pydantic-settings), so the same image runs anywhere with different limits or models.
+- **The engine is behind an interface.** The pipeline depends on `Transcriber.transcribe()`, not on Whisper. Another model, a hosted API or a test fake is a one-file change.
+- **Content is validated, not the extension.** ffprobe must find a real audio stream, and anything ffmpeg can decode is accepted, including the audio track of a video.
+- **One normalised format.** Every input becomes 16 kHz mono WAV, so the rest of the pipeline handles a single format. ffmpeg is the only decoder; the model receives the samples directly.
+- **Asynchronous jobs.** Transcription can take minutes, so uploads return `202` immediately and progress is polled. The model is loaded once and shared by the workers.
+- **Failures are classified.** Undecodable audio fails immediately; other errors are retried with exponential backoff, up to three attempts.
+- **Jobs survive restarts.** State is persisted, interrupted jobs are re-queued on startup, a job interrupted on its last attempt is failed rather than retried forever, and workers are idempotent.
+- **Privacy by default.** Audio is deleted when a job finishes; only the transcript is kept.
+- **Pauses come from word timestamps,** so they're found inside segments as well as between them.
+- **Configuration comes from environment variables,** so the same image runs anywhere with different limits or models.
+- **One container.** The Dockerfile builds the front end in a Node stage and ships only Python, ffmpeg, the model and static files. The live demo is built from this same Dockerfile.
 
 ## Answers to the assignment questions
 
-**1–3. Accept a file, transcribe it, return timestamps per segment.** `POST /v1/transcriptions` accepts the upload. A background job transcribes it with Whisper, and the result has segments with `start`/`end` in seconds (plus word-level timestamps), available as JSON, SRT, VTT or text.
+**1–3. Accept a file, transcribe it, return timestamps per segment.** `POST /v1/transcriptions` accepts the file (the web page can also record from the microphone and upload the recording). A background job transcribes it, and the result contains segments with `start`/`end` in seconds plus word-level timestamps, as JSON, SRT, VTT or text.
 
-**4. How do you handle different audio formats?** Two steps. First, *validation by content*: ffprobe must find an audio stream, so the extension is ignored. Second, *normalisation*: ffmpeg converts every input to 16 kHz mono 16-bit PCM WAV, the format Whisper was trained on. Anything ffmpeg can decode works, including video files. Broken files fail with a clear message instead of a crash, and ffmpeg runs with a timeout.
+**4. How do you handle different audio formats?** First, validate by content: ffprobe must find an audio stream with a readable duration, so renamed, empty or non-audio files are rejected with `415`. For browser recordings, whose WebM header has no duration, it's read from the packet timestamps. Then normalise: ffmpeg converts everything to 16 kHz mono 16-bit PCM WAV, the format Whisper was trained on. Supported inputs are anything ffmpeg decodes: WAV, MP3, M4A/AAC, FLAC, OGG/Opus, WebM, and the audio track of video files (MP4, MOV, MKV, …). ffmpeg runs with a timeout, and broken files fail with a clear message.
 
-**5. How do you deal with long audio files?**
-- **Not blocking the request:** the upload returns at once and the client polls a job with a progress percentage.
-- **Memory:** uploads are streamed to disk in chunks.
-- **Model context:** Whisper processes audio in 30 s windows and keeps absolute timestamps, so there's no hand-made chunk stitching that could cut words in half or misalign timestamps.
-- **Speed:** voice activity detection skips silence.
-- **Guardrail:** a configurable maximum duration (60 min by default).
-- **At larger scale:** split long files at silences into chunks, transcribe them in parallel on several workers or GPUs, and shift each chunk's timestamps by its offset when merging.
+**5. How do you deal with long audio files?** Uploads are streamed to disk, so memory stays flat. Transcription runs as a background job with progress reporting, so no request is held open. Whisper processes audio in 30-second windows while keeping absolute timestamps, so there's no manual stitching, and voice activity detection skips silence. A configurable maximum duration protects the service. At larger scale, I would split files at silences and transcribe the chunks in parallel across workers, offsetting each chunk's timestamps when merging.
 
-**6. How would you handle concurrent uploads?** Uploads are accepted immediately and queued. A fixed pool of workers (`PIPELINE_WORKERS`) shares one loaded model, because transcription is CPU/GPU-bound and running everything at once would only make every job slower. The queue is capped (`PIPELINE_MAX_PENDING_JOBS`), and the API answers `429` when it's full instead of falling over. At scale, I'd split the API from the workers: the API puts jobs on Redis (Celery/RQ), and GPU workers scale with the queue length. Uploads would go straight to object storage through pre-signed URLs, so the API never handles large bodies.
+**6. How would you handle concurrent uploads?** Uploads are accepted immediately and queued. A fixed pool of workers shares one loaded model, since transcription is compute-bound and unlimited parallelism would slow every job down. The queue is bounded, and the API returns `429` when it's full. At scale: separate API and worker processes connected by Redis (Celery or RQ), workers autoscaled on queue depth, and uploads sent straight to object storage through pre-signed URLs.
 
-**7. How would you store audio and transcripts?** Here: SQLite for job state and transcripts (JSON), and a local volume for audio, which is deleted once the job ends. In production: audio in object storage (S3/GCS) with a lifecycle rule that deletes it after N days, and job metadata and transcripts in Postgres (JSONB for segments, full-text search over the text). Large transcripts or exports could also go to object storage. Storage sits behind small classes (`JobStore`, `AudioStore`), so the swap is local.
+**7. How would you store audio and transcripts?** Here, SQLite holds job state and transcripts, and audio sits on a volume only while a job runs. In production: audio in object storage (S3/GCS) with a lifecycle rule for deletion, and jobs and transcripts in Postgres (JSONB segments, full-text search). Both stores are behind small classes (`JobStore`, `AudioStore`), so the change stays local.
 
-**8. How do you retry or recover failed transcriptions?**
-- **Classify errors:** permanent (bad audio) fails at once with a reason; temporary errors retry with exponential backoff, up to `PIPELINE_MAX_ATTEMPTS`.
-- **Persist state:** every transition (`queued → processing → done/failed`) and the attempt count are saved, so after a crash or redeploy unfinished jobs are re-queued automatically.
-- **Poison jobs:** a job that was interrupted on its last attempt is marked failed rather than retried forever.
-- **Duplicate deliveries:** workers are idempotent, so a duplicate queue entry does nothing.
-- **In production:** a dead-letter queue for final failures, alerts on failure rate, and a manual "retry" endpoint.
+**8. How do you retry or recover failed transcriptions?** Errors are classified: permanent ones (undecodable audio) fail immediately with a reason, and transient ones are retried with exponential backoff up to a limit. Every state change and attempt count is persisted, so unfinished jobs are re-queued after a crash or redeploy, jobs that keep crashing are failed instead of looping, and idempotent workers ignore duplicate deliveries. In production I'd add a dead-letter queue, alerting on failure rates, and a manual retry endpoint.
 
-**9. How would you expose this as an API?** A versioned REST API using the asynchronous job pattern: `POST /v1/transcriptions` → `202 Accepted` + `Location`; `GET` the job to poll; a separate export endpoint for subtitle formats. FastAPI generates the OpenAPI docs at `/docs`. Next I'd add API-key or OAuth authentication with per-key rate limits, webhooks (a callback URL notified when the job finishes) as an alternative to polling, pre-signed upload URLs for very large files, and request IDs in logs for tracing.
+**9. How would you expose this as an API?** As a versioned REST API using the asynchronous job pattern: `POST` returns `202 Accepted` with a `Location` header, `GET` polls the job, and a separate endpoint serves subtitle exports. OpenAPI docs are generated at `/docs`. For production: API keys or OAuth with per-key rate limits, webhooks as an alternative to polling, pre-signed uploads for very large files, and request IDs for tracing.
 
-## Benchmarks
+## Model choice and benchmarks
 
-Measured with `scripts/benchmark.py` on a laptop CPU (Intel i5-1145G7, 4 cores, int8), on 110 s of English speech (the JFK sample repeated 10 times), with word error rate against the known text:
+faster-whisper runs OpenAI's Whisper on CTranslate2: int8 on CPU, float16 on GPU, picked automatically. It's open source and runs locally (no per-minute cost, and audio never leaves the server), and it covers ~100 languages. Faster models such as NVIDIA Parakeet only cover English and European languages.
 
-| Model | Load | Transcribe 110 s | Speed | WER |
-|---|---|---|---|---|
-| base | 0.9 s | 22.1 s | 5.0x real time | 20.0% |
-| small | 1.3 s | 67.9 s | 1.6x real time | 0.5% |
-| **large-v3-turbo** | 4.3 s | 97.9 s | 1.1x real time | **0.0%** |
+Among the Whisper sizes, the default was chosen by measurement with `scripts/benchmark.py` (110 s of English speech, 4-core CPU, int8, word error rate against the known text):
 
-`base` is fast, but on longer audio it lost its place and **dropped a whole phrase twice**. `large-v3-turbo` was word-perfect while still running faster than real time on a laptop CPU, and it's much stronger on languages other than English, which is why it's the default. On a GPU it runs many times faster with no change in settings.
+| Model | Transcribe 110 s | Speed | WER |
+|---|---|---|---|
+| base | 22.1 s | 5.0x real time | 20.0% |
+| small | 67.9 s | 1.6x real time | 0.5% |
+| **large-v3-turbo** | 97.9 s | 1.1x real time | **0.0%** |
 
-Very short clips are relatively slower: Whisper always processes a full 30-second window, so an 11 s clip costs about as much as 30 s of audio (around 25 s on this CPU). To reproduce:
-
-```bash
-python -m scripts.benchmark samples/jfk.flac --models base small large-v3-turbo \
-  --reference "And so my fellow Americans, ask not what your country can do for you, ask what you can do for your country."
-```
+`base` silently dropped whole phrases on longer audio. `large-v3-turbo` was word-perfect, still faster than real time on CPU, and much stronger outside English, so it's the default. Any size can be selected with `PIPELINE_MODEL_SIZE`.
 
 ## Configuration
 
-Every setting is an environment variable with a sensible default (see `.env.example`):
+Environment variables (see `.env.example`):
 
-| Variable | Default | Meaning |
+| Variable | Default | |
 |---|---|---|
-| `PIPELINE_MODEL_SIZE` | `large-v3-turbo` | `tiny`, `base`, `small`, `medium`, `large-v3`, `large-v3-turbo` |
-| `PIPELINE_DEVICE` | `auto` | `auto` (GPU if available), `cpu` or `cuda` |
-| `PIPELINE_COMPUTE_TYPE` | `auto` | `float16` on GPU, `int8` on CPU |
-| `PIPELINE_BEAM_SIZE` | `5` | Higher is slightly more accurate and slower |
+| `PIPELINE_MODEL_SIZE` | `large-v3-turbo` | Any Whisper size, e.g. `base`, `small`, `large-v3` |
+| `PIPELINE_DEVICE` / `PIPELINE_COMPUTE_TYPE` | `auto` / `auto` | GPU with float16 if available, otherwise CPU with int8 |
 | `PIPELINE_MAX_UPLOAD_MB` | `500` | Upload size limit |
 | `PIPELINE_MAX_DURATION_MINUTES` | `60` | Audio length limit |
-| `PIPELINE_WORKERS` | `1` | Jobs transcribed at the same time |
-| `PIPELINE_MAX_PENDING_JOBS` | `20` | Queue size before uploads get `429` |
-| `PIPELINE_MAX_ATTEMPTS` | `3` | Attempts for temporary failures |
+| `PIPELINE_WORKERS` | `1` | Concurrent transcriptions |
+| `PIPELINE_MAX_PENDING_JOBS` | `20` | Queue size before `429` |
+| `PIPELINE_MAX_ATTEMPTS` | `3` | Attempts for transient failures |
 | `PIPELINE_PAUSE_THRESHOLD_SECONDS` | `1.5` | Shortest gap reported as a pause |
-| `PIPELINE_DATA_DIR` / `PIPELINE_MODEL_DIR` | `data` / `models` | Where jobs, audio and models live |
 
 ## Tests
 
 ```bash
 pip install -r requirements-dev.txt
-pytest              # 42 fast tests, about 7 s, using a fake engine and audio generated with ffmpeg
-pytest -m slow      # one end-to-end test with a real Whisper model on samples/jfk.flac
+pytest            # fast suite, using a fake engine and audio generated with ffmpeg
+pytest -m slow    # end-to-end with a real Whisper model on samples/jfk.flac
 ```
 
-The fast tests cover every upload rejection, format conversion, clean-up, pauses, stats, every export format, the full API flow, retries with backoff, permanent failures, and recovery after a restart.
+The suite covers upload validation, format conversion (including browser recordings), clean-up, pauses, stats, exports, the full API flow, retries and backoff, permanent failures, and recovery after a restart. GitHub Actions runs it on every push, along with the front-end type check, build and lint, and a Docker build.
 
-## Limitations and next steps
+## Limitations
 
-- **One process.** The queue lives in memory (state is persisted in SQLite), so the service scales vertically. Horizontal scaling means moving to Redis-backed workers, as described in Q6.
-- **No authentication.** Fine for a demo; see Q9 for what production needs.
-- **CPU speed.** A large model on a small CPU server runs at around real time. A GPU is many times faster and is used automatically when present.
-- **Fillers ("um", "uh") are mostly not transcribed.** Whisper was trained on cleaned-up transcripts and tends to drop them. Pauses are detected reliably; fillers would need a verbatim-tuned model or prompting.
-- **Urdu is written in Urdu script.** Romanised Urdu would need a transliteration step after transcription (e.g. an LLM rewriting each segment while keeping its timestamps).
-- **No speaker labels** (who spoke when). That would need a diarisation model such as pyannote, merged with the word timestamps.
+- **Single process.** State is persisted, but the queue is in memory, so the service scales vertically. Horizontal scaling needs a shared queue (see Q6).
+- **No authentication** on the demo (see Q9).
+- **One language per file.** Whisper detects the language from the first ~30 s and writes the whole transcript in it, so with mixed-language speech the other language may come out translated. Passing `language` controls this.
+- **Fillers** such as "um" are usually omitted by Whisper. Pauses are reported instead.
+- **No speaker diarisation.** It could be added with a model such as pyannote, aligned to the word timestamps.
 
-## Running it yourself
+## Running locally
 
-Not needed to try it (see the live demo above), but here's how.
-
-### With Docker
+With Docker (the model is baked into the image):
 
 ```bash
 docker build -t transcription-pipeline .
 docker run -p 8000:8000 -v transcripts:/app/data transcription-pipeline
 ```
 
-Open http://localhost:8000 for the upload page, or http://localhost:8000/docs for the interactive API docs. The model is downloaded during the build, so the container starts ready and works offline. Use `--build-arg MODEL_SIZE=base` for a smaller, faster image.
-
-### Without Docker
-
-Needs Python 3.12, ffmpeg on the PATH, and Node 20+ to build the page.
+Without Docker (Python 3.12, ffmpeg and Node 20+):
 
 ```bash
-cd frontend && npm ci && npm run build && cd ..   # builds the page into app/static
-python -m venv .venv
-source .venv/bin/activate            # Windows: .venv\Scripts\activate
+cd frontend && npm ci && npm run build && cd ..
+python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 uvicorn app.main:app --port 8000
 ```
 
-The model is downloaded into `models/` on first start. Without the page build, the API and `/docs` still work.
+Then open http://localhost:8000.
 
-`samples/jfk.flac` is the public-domain JFK inaugural address excerpt that Whisper's own test suite uses.
+`samples/jfk.flac` is the public-domain clip used by Whisper's own test suite.
