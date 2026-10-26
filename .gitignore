@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+
+# Frontend: dependencies, and the built page (made by `npm run build` or the Dockerfile)
+node_modules/
+app/static/
+
+# Local settings and secrets
+.env
+
+# Runtime data: uploads, converted audio, the job database, downloaded models
+data/
+models/
+*.log
+
+# Editors and OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
