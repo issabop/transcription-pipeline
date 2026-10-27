@@ -67,3 +67,20 @@ class Job(BaseModel):
     result: Transcript | None
     created_at: datetime
     updated_at: datetime
+
+
+class NewUpload(BaseModel):
+    size: int = Field(description="Total size of the file in bytes")
+
+
+class UploadSession(BaseModel):
+    id: str
+    chunk_size: int = Field(description="Send the file in pieces of at most this many bytes")
+
+
+class UploadProgress(BaseModel):
+    received: int = Field(description="Bytes received so far; the offset for the next chunk")
+
+
+class CompleteUpload(BaseModel):
+    language: str | None = Field(default=None, description="ISO code such as 'en' or 'ur'. Omit to auto-detect.")

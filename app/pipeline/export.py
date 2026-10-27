@@ -26,15 +26,22 @@ def to_txt(transcript: Transcript, include_pauses: bool = False) -> str:
     pause_after = {p.start: p for p in transcript.pauses}  # keyed by the end time of the word before it
     lines = []
     for s in transcript.segments:
-        parts, trailing = [], None
+        # Insert markers into the segment's own text rather than re-joining the words, because Whisper
+        # splits some words into pieces ("take" + "-home") and joining them with spaces would break them.
+        text, cursor, trailing = s.text, 0, None
         for i, w in enumerate(s.words):
-            parts.append(w.text)
+            found = text.find(w.text, cursor)
+            if found == -1:
+                continue
+            cursor = found + len(w.text)
             if pause := pause_after.get(w.end):
                 if i == len(s.words) - 1:
                     trailing = pause
                 else:
-                    parts.append(_marker(pause))
-        lines.append(" ".join(parts) if parts else s.text)
+                    marker = f" {_marker(pause)}"
+                    text = text[:cursor] + marker + text[cursor:]
+                    cursor += len(marker)
+        lines.append(text)
         if trailing:
             lines.append(_marker(trailing))
     return "\n".join(lines) + "\n"

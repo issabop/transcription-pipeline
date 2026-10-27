@@ -38,6 +38,7 @@ curl "https://transcribe.issaumer.com/v1/transcriptions/<id>/transcript?format=s
 | `POST /v1/transcriptions` | Multipart upload: `file`, plus optional `language` (e.g. `en`, `ur`; auto-detected if omitted). Returns `202` with the job and a `Location` header |
 | `GET /v1/transcriptions/{id}` | Status (`queued`, `processing`, `done`, `failed`), progress, and the transcript once done |
 | `GET /v1/transcriptions/{id}/transcript` | `format=srt`, `vtt` or `txt`; with `txt`, `pauses=true` adds `[pause 2.1s]` markers |
+| `POST /v1/uploads` → `PUT /v1/uploads/{id}?offset=N` → `POST /v1/uploads/{id}/complete` | Chunked upload for big files or slow connections: start with the file size, send ≤ 2 MB pieces, then complete (optional `language`). Returns the same `202` job |
 | `GET /v1/languages` | Supported language codes |
 | `GET /health` | Liveness, model, device and limits |
 
@@ -87,6 +88,7 @@ upload ──► ingest ──► queue ──► worker: audio ──► transc
 ## Design decisions
 
 - **The engine is behind an interface.** The pipeline depends on `Transcriber.transcribe()`, not on Whisper. Another model, a hosted API or a test fake is a one-file change.
+- **Big files are uploaded in chunks.** One long upload can be cut off by a proxy timeout on a slow connection, so the page sends files over 2 MB as 2 MB pieces. Each request takes seconds, a failed piece is retried, and resending is safe because every piece carries its offset. The assembled file goes through exactly the same validation as a direct upload.
 - **Content is validated, not the extension.** ffprobe must find a real audio stream, and anything ffmpeg can decode is accepted, including the audio track of a video.
 - **One normalised format.** Every input becomes 16 kHz mono WAV, so the rest of the pipeline handles a single format. ffmpeg is the only decoder; the model receives the samples directly.
 - **Asynchronous jobs.** Transcription can take minutes, so uploads return `202` immediately and progress is polled. The model is loaded once and shared by the workers.
@@ -103,7 +105,7 @@ upload ──► ingest ──► queue ──► worker: audio ──► transc
 
 **4. How do you handle different audio formats?** First, validate by content: ffprobe must find an audio stream with a readable duration, so renamed, empty or non-audio files are rejected with `415`. For browser recordings, whose WebM header has no duration, it's read from the packet timestamps. Then normalise: ffmpeg converts everything to 16 kHz mono 16-bit PCM WAV, the format Whisper was trained on. Supported inputs are anything ffmpeg decodes: WAV, MP3, M4A/AAC, FLAC, OGG/Opus, WebM, and the audio track of video files (MP4, MOV, MKV, …). ffmpeg runs with a timeout, and broken files fail with a clear message.
 
-**5. How do you deal with long audio files?** Uploads are streamed to disk, so memory stays flat. Transcription runs as a background job with progress reporting, so no request is held open. Whisper processes audio in 30-second windows while keeping absolute timestamps, so there's no manual stitching, and voice activity detection skips silence. A configurable maximum duration protects the service. At larger scale, I would split files at silences and transcribe the chunks in parallel across workers, offsetting each chunk's timestamps when merging.
+**5. How do you deal with long audio files?** Big files are uploaded in 2 MB chunks (with retries), so a slow connection never hits a request timeout, and they're streamed to disk, so memory stays flat. Transcription runs as a background job with progress reporting, so no request is held open. Whisper processes audio in 30-second windows while keeping absolute timestamps, so there's no manual stitching, and voice activity detection skips silence. A configurable maximum duration protects the service. At larger scale, I would split files at silences and transcribe the chunks in parallel across workers, offsetting each chunk's timestamps when merging.
 
 **6. How would you handle concurrent uploads?** Uploads are accepted immediately and queued. A fixed pool of workers shares one loaded model, since transcription is compute-bound and unlimited parallelism would slow every job down. The queue is bounded, and the API returns `429` when it's full. At scale: separate API and worker processes connected by Redis (Celery or RQ), workers autoscaled on queue depth, and uploads sent straight to object storage through pre-signed URLs.
 
@@ -150,7 +152,7 @@ pytest            # fast suite, using a fake engine and audio generated with ffm
 pytest -m slow    # end-to-end with a real Whisper model on samples/jfk.flac
 ```
 
-The suite covers upload validation, format conversion (including browser recordings), clean-up, pauses, stats, exports, the full API flow, retries and backoff, permanent failures, and recovery after a restart. GitHub Actions runs it on every push, along with the front-end type check, build and lint, and a Docker build.
+The suite covers upload validation, chunked uploads (resends, gaps, missing bytes, size limits, unsafe ids, clean-up), format conversion (including browser recordings), clean-up, pauses, stats, exports, the full API flow, retries and backoff, permanent failures, and recovery after a restart. GitHub Actions runs it on every push, along with the front-end type check, build and lint, and a Docker build.
 
 ## Limitations
 

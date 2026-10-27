@@ -2,7 +2,7 @@
 
 from app.pipeline.export import timestamp, to_srt, to_txt, to_vtt
 from app.pipeline.process import build_transcript
-from app.pipeline.transcribe import RawTranscript
+from app.pipeline.transcribe import RawSegment, RawTranscript, RawWord
 from tests.conftest import FAKE_SEGMENTS
 
 
@@ -49,6 +49,17 @@ def test_srt():
 
 def test_vtt():
     assert to_vtt(transcript()).startswith("WEBVTT\n\n00:00:00.000 --> 00:00:02.000\nHello there.\n")
+
+
+def test_pause_markers_keep_words_whisper_splits_into_pieces():
+    # Whisper returns "take-home" as the pieces " take" and "-home"; the text must stay "take-home".
+    raw = RawTranscript("en", 0.9, 6.0, [
+        RawSegment(0.0, 6.0, " a take-home task", [
+            RawWord(0.0, 0.5, " a"), RawWord(2.5, 3.0, " take"), RawWord(3.0, 3.4, "-home"), RawWord(3.5, 4.0, " task"),
+        ]),
+    ])
+    t = build_transcript(raw, pause_threshold=1.5)
+    assert to_txt(t, include_pauses=True) == "a [pause 2.0s] take-home task\n"
 
 
 def test_txt_with_and_without_pauses():

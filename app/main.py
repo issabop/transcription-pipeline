@@ -6,16 +6,18 @@ from pathlib import Path
 from typing import Annotated, Literal
 
 from fastapi import FastAPI, Form, HTTPException, Query, Request, Response, UploadFile
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 
 from app.config import Settings, settings
 from app.jobs import JobRunner
-from app.models import Job
+from app.models import AudioInfo, CompleteUpload, Job, NewUpload, UploadProgress, UploadSession
 from app.pipeline.export import to_srt, to_txt, to_vtt
-from app.pipeline.ingest import MB, AudioTooLong, FileTooLarge, IngestError, NotAudio, ingest
+from app.pipeline.ingest import MB, AudioTooLong, FileTooLarge, IngestError, NotAudio, ingest, validate
 from app.pipeline.transcribe import Transcriber, WhisperTranscriber
 from app.storage import AudioStore, JobStore
+from app.uploads import CHUNK_SIZE, ChunkedUploads, OffsetMismatch, UploadError, UploadIncomplete, UploadNotFound
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
@@ -24,9 +26,10 @@ STATIC_DIR = Path(__file__).parent / "static"
 
 # The pipeline raises plain Python errors; only this file knows about HTTP status codes.
 INGEST_ERROR_STATUS = {FileTooLarge: 413, NotAudio: 415, AudioTooLong: 422}
+UPLOAD_ERROR_STATUS = {UploadNotFound: 404, OffsetMismatch: 409, UploadIncomplete: 409}
 
 EXPORTS = {
-    "srt": ("application/x-subrip", to_srt),
+    "srt": ("application/x-subrip; charset=utf-8", to_srt),
     "vtt": ("text/vtt", to_vtt),
     "txt": ("text/plain", to_txt),
 }
@@ -43,6 +46,8 @@ def create_app(config: Settings = settings, transcriber: Transcriber | None = No
         app.state.transcriber = engine
         app.state.store = JobStore(config.data_dir / "jobs.db")
         app.state.audio = AudioStore(config.data_dir)
+        app.state.uploads = ChunkedUploads(config.data_dir / "partial", config.max_upload_mb * MB)
+        app.state.uploads.remove_stale()
         app.state.runner = JobRunner(
             app.state.store, app.state.audio, engine, config.workers, config.max_attempts, config.pause_threshold_seconds
         )
@@ -59,6 +64,22 @@ def create_app(config: Settings = settings, transcriber: Transcriber | None = No
     @app.exception_handler(IngestError)
     def ingest_error(request: Request, exc: IngestError) -> JSONResponse:
         return JSONResponse(status_code=INGEST_ERROR_STATUS[type(exc)], content={"detail": str(exc)})
+
+    @app.exception_handler(UploadError)
+    def upload_error(request: Request, exc: UploadError) -> JSONResponse:
+        return JSONResponse(status_code=UPLOAD_ERROR_STATUS[type(exc)], content={"detail": str(exc)})
+
+    def check_can_queue(state, language: str | None) -> None:
+        if language and language not in state.transcriber.supported_languages:
+            raise HTTPException(422, f"Unsupported language '{language}'")
+        if state.store.count_pending() >= config.max_pending_jobs:
+            raise HTTPException(429, "Too many jobs in the queue, try again in a few minutes")
+
+    def queue_job(state, response: Response, path: Path, info: AudioInfo, language: str | None) -> Job:
+        job = state.store.create(path.name, language, info)
+        state.runner.submit(job.id)
+        response.headers["Location"] = f"/v1/transcriptions/{job.id}"
+        return job
 
     @app.middleware("http")
     async def reject_oversized_bodies(request: Request, call_next):
@@ -98,16 +119,39 @@ def create_app(config: Settings = settings, transcriber: Transcriber | None = No
         """Upload an audio or video file. Returns a job straight away; transcription runs in the background."""
         state = request.app.state
         language = language or None  # an empty form field means auto-detect
-        if language and language not in state.transcriber.supported_languages:
-            raise HTTPException(422, f"Unsupported language '{language}'")
-        if state.store.count_pending() >= config.max_pending_jobs:
-            raise HTTPException(429, "Too many jobs in the queue, try again in a few minutes")
-
+        check_can_queue(state, language)
         path, info = ingest(file.file, state.audio.upload_dir, config.max_upload_mb * MB, config.max_duration_minutes * 60)
-        job = state.store.create(path.name, language, info)
-        state.runner.submit(job.id)
-        response.headers["Location"] = f"/v1/transcriptions/{job.id}"
-        return job
+        return queue_job(state, response, path, info, language)
+
+    @app.post("/v1/uploads", status_code=201)
+    def create_upload(request: Request, body: NewUpload) -> UploadSession:
+        """Start a chunked upload, for big files or slow connections. Send the chunks, then complete it."""
+        return UploadSession(id=request.app.state.uploads.create(body.size), chunk_size=CHUNK_SIZE)
+
+    @app.put("/v1/uploads/{upload_id}")
+    async def upload_chunk(
+        request: Request,
+        upload_id: str,
+        offset: Annotated[int, Query(ge=0, description="Where this chunk starts in the file")],
+    ) -> UploadProgress:
+        """Send one chunk as the raw request body. Resending a chunk at the same offset is safe."""
+        data = bytearray()
+        async for part in request.stream():  # read as it arrives, and stop as soon as it's too big
+            data += part
+            if len(data) > CHUNK_SIZE:
+                raise HTTPException(413, f"Chunks can be at most {CHUNK_SIZE} bytes")
+        received = await run_in_threadpool(request.app.state.uploads.write, upload_id, offset, bytes(data))
+        return UploadProgress(received=received)
+
+    @app.post("/v1/uploads/{upload_id}/complete", status_code=202, response_model=Job)
+    def complete_upload(request: Request, response: Response, upload_id: str, body: CompleteUpload) -> Job:
+        """Finish a chunked upload. The file is validated exactly like a direct upload, then queued."""
+        state = request.app.state
+        language = body.language or None
+        check_can_queue(state, language)
+        path = state.uploads.finish(upload_id, state.audio.upload_path(upload_id))
+        info = validate(path, config.max_duration_minutes * 60)
+        return queue_job(state, response, path, info, language)
 
     @app.get("/v1/transcriptions/{job_id}", response_model=Job)
     def get_transcription(request: Request, job_id: str) -> Job:

@@ -66,6 +66,7 @@ export default function App() {
   const [job, setJob] = useState<Job | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [uploading, setUploading] = useState(false)
+  const [uploadProgress, setUploadProgress] = useState(0)
   const [showPauses, setShowPauses] = useState(false)
   const timer = useRef<number | undefined>(undefined)
 
@@ -103,8 +104,9 @@ export default function App() {
     setError(null)
     setJob(null)
     setUploading(true)
+    setUploadProgress(0)
     try {
-      const created = await createJob(selected, language === "auto" ? null : language)
+      const created = await createJob(selected, language === "auto" ? null : language, setUploadProgress)
       setJob(created)
       poll(created.id)
     } catch (e) {
@@ -182,7 +184,7 @@ export default function App() {
               <div className="flex flex-wrap items-center gap-3">
                 <Button type="submit" disabled={!selected || busy}>
                   {busy ? <Loader2 className="animate-spin" /> : <FileAudio />}
-                  {uploading ? "Uploading…" : busy ? "Transcribing…" : "Transcribe"}
+                  {uploading ? `Uploading ${Math.round(uploadProgress * 100)}%…` : busy ? "Transcribing…" : "Transcribe"}
                 </Button>
                 {!selected && !busy && (
                   <span className="text-sm text-muted-foreground">
@@ -200,6 +202,18 @@ export default function App() {
             <AlertTitle>Something went wrong</AlertTitle>
             <AlertDescription>{error}</AlertDescription>
           </Alert>
+        )}
+
+        {uploading && (
+          <Card>
+            <CardContent className="flex flex-col gap-3">
+              <div className="flex items-center justify-between gap-4 text-sm text-muted-foreground">
+                <span>Uploading…</span>
+                <span className="tabular-nums">{Math.round(uploadProgress * 100)}%</span>
+              </div>
+              <Progress value={uploadProgress * 100} />
+            </CardContent>
+          </Card>
         )}
 
         {job && job.status !== "done" && <JobStatusCard job={job} />}
@@ -339,18 +353,7 @@ function SegmentRow({
           {clock(segment.start)} → {clock(segment.end)}
         </time>
         <p dir="auto" className="leading-relaxed">
-          {showPauses && words.length
-            ? words.map((w, i) => {
-                const pause = i < words.length - 1 ? pauseAfter.get(w.end) : undefined
-                return (
-                  <span key={i}>
-                    {i > 0 && " "}
-                    {w.text}
-                    {pause && <PauseBadge duration={pause.duration} />}
-                  </span>
-                )
-              })
-            : segment.text}
+          {showPauses ? withInlinePauses(segment, pauseAfter) : segment.text}
         </p>
       </div>
       {trailing && (
@@ -360,6 +363,27 @@ function SegmentRow({
       )}
     </li>
   )
+}
+
+// Splits the segment's own text at each pause, rather than re-joining the words with spaces, because
+// Whisper returns some words in pieces ("take" + "-home") and joining them would break them apart.
+function withInlinePauses(segment: Segment, pauseAfter: Map<number, { duration: number }>): React.ReactNode[] {
+  const { text, words } = segment
+  const parts: React.ReactNode[] = []
+  let cursor = 0
+  let from = 0
+  words.forEach((w, i) => {
+    const found = text.indexOf(w.text, cursor)
+    if (found === -1) return
+    cursor = found + w.text.length
+    const pause = i < words.length - 1 ? pauseAfter.get(w.end) : undefined
+    if (pause) {
+      parts.push(text.slice(from, cursor), <PauseBadge key={i} duration={pause.duration} />)
+      from = cursor
+    }
+  })
+  parts.push(text.slice(from))
+  return parts
 }
 
 function PauseBadge({ duration }: { duration: number }) {

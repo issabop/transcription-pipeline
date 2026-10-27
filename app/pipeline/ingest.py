@@ -32,6 +32,11 @@ class AudioTooLong(IngestError):
 def ingest(source: BinaryIO, upload_dir: Path, max_bytes: int, max_seconds: float) -> tuple[Path, AudioInfo]:
     """Save the upload and validate it. Nothing is left on disk if it's rejected."""
     path = save_upload(source, upload_dir, max_bytes)
+    return path, validate(path, max_seconds)
+
+
+def validate(path: Path, max_seconds: float) -> AudioInfo:
+    """Check a file on disk really is audio within the length limit. A rejected file is deleted."""
     try:
         info = probe(path)
         if info.duration > max_seconds:
@@ -39,7 +44,7 @@ def ingest(source: BinaryIO, upload_dir: Path, max_bytes: int, max_seconds: floa
     except IngestError:
         path.unlink(missing_ok=True)
         raise
-    return path, info
+    return info
 
 
 def save_upload(source: BinaryIO, upload_dir: Path, max_bytes: int) -> Path:
